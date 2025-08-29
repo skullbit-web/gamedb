@@ -1,190 +1,180 @@
-name: Vimm Vault Auto-Downloader
+name: Vimm Vault Scraper
 
 on:
   workflow_dispatch:
     inputs:
       system:
-        description: "Vault system (e.g., N64, Wii, GBA, GameCube, PS2)"
+        description: "Vault system (e.g., N64, GBA, Wii, PS2)"
         required: true
         default: "N64"
       max_pages:
-        description: "Safety cap on pagination (>=1)"
+        description: "Max pages to scrape"
         required: true
-        default: "50"
+        default: 50
 
 jobs:
-  download-games:
+  scrape-and-download:
     runs-on: ubuntu-latest
+
     steps:
-      # Checkout repo
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false  # disable default creds
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false  # important for using GITHUB_TOKEN for push
 
-      # Configure Git for push with token
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+    - name: Set up Git for push
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
 
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
 
-      # Fix SSL certificates on runner
-      - name: Fix SSL Certificates
-        run: sudo apt-get update && sudo apt-get install -y ca-certificates
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests beautifulsoup4
 
-      # Set up Python
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
+    - name: Scrape, download, and push games
+      env:
+        SYSTEM: ${{ github.event.inputs.system }}
+        MAX_PAGES: ${{ github.event.inputs.max_pages }}
+      run: |
+        cat > scrape_and_build.py << 'PY'
+        import os
+        import json
+        import re
+        import time
+        import requests
+        import subprocess
+        from bs4 import BeautifulSoup
 
-      # Install dependencies
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+        requests.packages.urllib3.disable_warnings()
 
-      # Run scraper + downloader
-      - name: Scrape, download games, and push
-        env:
-          SYSTEM: ${{ github.event.inputs.system }}
-          MAX_PAGES: ${{ github.event.inputs.max_pages }}
-        run: |
-          cat > scrape_and_build.py << 'PY'
-          import os
-          import json
-          import re
-          import time
-          import requests
-          import subprocess
-          from bs4 import BeautifulSoup
+        SYSTEM = os.environ.get("SYSTEM", "N64")
+        MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
 
-          # Disable SSL warnings
-          requests.packages.urllib3.disable_warnings()
+        base_url = "https://vimm.net/vault/"
+        params_template = {
+            "mode": "adv",
+            "p": "list",
+            "system": SYSTEM,
+            "sort": "Title",
+            "sortOrder": "ASC",
+        }
 
-          SYSTEM = os.environ.get("SYSTEM", "N64")
-          MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Metadata-Indexer (GitHub Actions)",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
-          base_url = "https://vimm.net/vault/"
-          params_template = {
-              "mode": "adv",
-              "p": "list",
-              "system": SYSTEM,
-              "sort": "Title",
-              "sortOrder": "ASC",
-          }
+        # Load previous index
+        index_path = os.path.join("vimm", "index.json")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                all_games = json.load(f)
+            downloaded_ids = {g["id"] for g in all_games if g.get("file")}
+        else:
+            all_games = []
+            downloaded_ids = set()
 
-          session = requests.Session()
-          session.headers.update({
-              "User-Agent": "Metadata-Indexer (GitHub Actions)",
-              "Accept-Language": "en-US,en;q=0.9",
-          })
+        for page in range(1, MAX_PAGES + 1):
+            params = dict(params_template)
+            params["page"] = page
+            try:
+                r = session.get(base_url, params=params, timeout=20, verify=False)
+            except Exception as e:
+                print(f"Failed to fetch page {page}: {e}")
+                break
+            if r.status_code != 200:
+                print(f"Stopped at page {page}, status code {r.status_code}")
+                break
 
-          # Load previous index if exists
-          index_path = os.path.join("vimm", "index.json")
-          if os.path.exists(index_path):
-              with open(index_path, "r", encoding="utf-8") as f:
-                  all_games = json.load(f)
-              downloaded_ids = {g["id"] for g in all_games if g.get("file")}
-          else:
-              all_games = []
-              downloaded_ids = set()
+            soup = BeautifulSoup(r.text, "html.parser")
+            links = soup.select('a[href*="/vault/?id="]')
+            if not links:
+                break
 
-          for page in range(1, MAX_PAGES + 1):
-              params = dict(params_template)
-              params["page"] = page
-              try:
-                  r = session.get(base_url, params=params, timeout=20, verify=False)
-              except Exception as e:
-                  print(f"Failed to fetch page {page}: {e}")
-                  break
-              if r.status_code != 200:
-                  print(f"Stopped at page {page}, status code {r.status_code}")
-                  break
+            for a in links:
+                title = a.get_text(strip=True)
+                href = a.get("href", "")
+                url = f"https://vimm.net{href}" if href.startswith("/") else f"https://vimm.net/vault/{href}"
+                m = re.search(r"[?&]id=(\d+)", url)
+                game_id = m.group(1) if m else ""
+                if not title or game_id in downloaded_ids:
+                    continue
 
-              soup = BeautifulSoup(r.text, "html.parser")
-              links = soup.select('a[href*="/vault/?id="]')
-              if not links:
-                  break
+                safe_name = re.sub(r'[^A-Za-z0-9_. -]', '_', title)[:100]
+                path = os.path.join("vimm", "games", SYSTEM, safe_name)
+                os.makedirs(path, exist_ok=True)
 
-              for a in links:
-                  title = a.get_text(strip=True)
-                  href = a.get("href", "")
-                  url = f"https://vimm.net{href}" if href.startswith("/") else f"https://vimm.net/vault/{href}"
-                  m = re.search(r"[?&]id=(\d+)", url)
-                  game_id = m.group(1) if m else ""
-                  if not title or game_id in downloaded_ids:
-                      continue
+                download_url = None
+                game_file = None
 
-                  safe_name = re.sub(r'[^A-Za-z0-9_. -]', '_', title)[:100]
-                  path = os.path.join("vimm", "games", SYSTEM, safe_name)
-                  os.makedirs(path, exist_ok=True)
+                # Fetch detail page
+                try:
+                    detail = session.get(url, timeout=20, verify=False)
+                    if detail.status_code == 200:
+                        detail_soup = BeautifulSoup(detail.text, "html.parser")
+                        dl = detail_soup.select_one('a[href*="/download.php"]')
+                        if dl and dl.get("href"):
+                            dl_href = dl.get("href")
+                            download_url = f"https://vimm.net{dl_href}" if dl_href.startswith("/") else dl_href
 
-                  download_url = None
-                  game_file = None
+                    # Download game
+                    if download_url:
+                        with session.get(download_url, stream=True, timeout=60, verify=False) as resp:
+                            if resp.status_code == 200:
+                                cd = resp.headers.get("Content-Disposition", "")
+                                ext = ".bin"
+                                m = re.search(r'filename="?([^";]+)"?', cd)
+                                if m:
+                                    filename = m.group(1)
+                                    _, ext = os.path.splitext(filename)
+                                else:
+                                    _, ext = os.path.splitext(download_url)
 
-                  # Fetch detail page
-                  try:
-                      detail = session.get(url, timeout=20, verify=False)
-                      if detail.status_code == 200:
-                          detail_soup = BeautifulSoup(detail.text, "html.parser")
-                          dl = detail_soup.select_one('a[href*="/download.php"]')
-                          if dl and dl.get("href"):
-                              dl_href = dl.get("href")
-                              download_url = f"https://vimm.net{dl_href}" if dl_href.startswith("/") else dl_href
+                                game_file = os.path.join(path, f"{safe_name}{ext}")
+                                with open(game_file, "wb") as f:
+                                    for chunk in resp.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                                print(f"Downloaded: {game_file}")
+                except Exception as e:
+                    print(f"Failed to download {title}: {e}")
 
-                      # Download game
-                      if download_url:
-                          with session.get(download_url, stream=True, timeout=60, verify=False) as resp:
-                              if resp.status_code == 200:
-                                  cd = resp.headers.get("Content-Disposition", "")
-                                  ext = ".bin"
-                                  m = re.search(r'filename="?([^";]+)"?', cd)
-                                  if m:
-                                      filename = m.group(1)
-                                      _, ext = os.path.splitext(filename)
-                                  else:
-                                      _, ext = os.path.splitext(download_url)
+                game_info = {
+                    "system": SYSTEM,
+                    "title": title,
+                    "id": game_id,
+                    "url": url,
+                    "folder": path,
+                    "download_url": download_url,
+                    "file": game_file,
+                }
 
-                                  game_file = os.path.join(path, f"{safe_name}{ext}")
-                                  with open(game_file, "wb") as f:
-                                      for chunk in resp.iter_content(chunk_size=8192):
-                                          if chunk:
-                                              f.write(chunk)
-                                  print(f"Downloaded: {game_file}")
-                  except Exception as e:
-                      print(f"Failed to download {title}: {e}")
+                all_games.append(game_info)
+                downloaded_ids.add(game_id)
+                time.sleep(2)
 
-                  game_info = {
-                      "system": SYSTEM,
-                      "title": title,
-                      "id": game_id,
-                      "url": url,
-                      "folder": path,
-                      "download_url": download_url,
-                      "file": game_file,
-                  }
+        # Save metadata
+        os.makedirs("vimm", exist_ok=True)
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(all_games, f, indent=2, ensure_ascii=False)
+        print(f"Updated metadata + files for {len(all_games)} games to {index_path}")
 
-                  all_games.append(game_info)
-                  downloaded_ids.add(game_id)
-                  time.sleep(2)
+        # Git commit & push new files
+        try:
+            subprocess.run(["git", "add", "vimm/"], check=True)
+            subprocess.run(["git", "commit", "-m", f"Add/update {SYSTEM} games"], check=False)
+            subprocess.run(["git", "push", "origin", "HEAD"], check=True)
+            print("Pushed new games to repo")
+        except Exception as e:
+            print(f"Git push failed: {e}")
+        PY
 
-          # Save metadata
-          os.makedirs("vimm", exist_ok=True)
-          with open(index_path, "w", encoding="utf-8") as f:
-              json.dump(all_games, f, indent=2, ensure_ascii=False)
-          print(f"Updated metadata + files for {len(all_games)} games to {index_path}")
-
-          # Git commit & push new files
-          try:
-              subprocess.run(["git", "add", "vimm/"], check=True)
-              subprocess.run(["git", "commit", "-m", f"Add/update {SYSTEM} games"], check=False)
-              subprocess.run(["git", "push", "origin", "HEAD"], check=True)
-              print("Pushed new games to repo")
-          except Exception as e:
-              print(f"Git push failed: {e}")
-          PY
-
-          python scrape_and_build.py
+        python scrape_and_build.py
