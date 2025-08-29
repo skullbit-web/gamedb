@@ -16,30 +16,52 @@ jobs:
   download-games:
     runs-on: ubuntu-latest
     steps:
+      # Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true  # Needed to push
+          persist-credentials: false  # disable default creds
 
+      # Configure Git for push with token
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+      # Fix SSL certificates on runner
+      - name: Fix SSL Certificates
+        run: sudo apt-get update && sudo apt-get install -y ca-certificates
+
+      # Set up Python
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
+      # Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Scrape, build, download games, and push
+      # Run scraper + downloader
+      - name: Scrape, download games, and push
         env:
           SYSTEM: ${{ github.event.inputs.system }}
           MAX_PAGES: ${{ github.event.inputs.max_pages }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cat > scrape_and_build.py << 'PY'
-          import os, json, re, time, requests, subprocess
+          import os
+          import json
+          import re
+          import time
+          import requests
+          import subprocess
           from bs4 import BeautifulSoup
+
+          # Disable SSL warnings
+          requests.packages.urllib3.disable_warnings()
 
           SYSTEM = os.environ.get("SYSTEM", "N64")
           MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
@@ -73,11 +95,12 @@ jobs:
               params = dict(params_template)
               params["page"] = page
               try:
-                  r = session.get(base_url, params=params, timeout=20)
+                  r = session.get(base_url, params=params, timeout=20, verify=False)
               except Exception as e:
                   print(f"Failed to fetch page {page}: {e}")
                   break
               if r.status_code != 200:
+                  print(f"Stopped at page {page}, status code {r.status_code}")
                   break
 
               soup = BeautifulSoup(r.text, "html.parser")
@@ -92,7 +115,7 @@ jobs:
                   m = re.search(r"[?&]id=(\d+)", url)
                   game_id = m.group(1) if m else ""
                   if not title or game_id in downloaded_ids:
-                      continue  # skip already downloaded
+                      continue
 
                   safe_name = re.sub(r'[^A-Za-z0-9_. -]', '_', title)[:100]
                   path = os.path.join("vimm", "games", SYSTEM, safe_name)
@@ -100,8 +123,10 @@ jobs:
 
                   download_url = None
                   game_file = None
+
+                  # Fetch detail page
                   try:
-                      detail = session.get(url, timeout=20)
+                      detail = session.get(url, timeout=20, verify=False)
                       if detail.status_code == 200:
                           detail_soup = BeautifulSoup(detail.text, "html.parser")
                           dl = detail_soup.select_one('a[href*="/download.php"]')
@@ -109,8 +134,9 @@ jobs:
                               dl_href = dl.get("href")
                               download_url = f"https://vimm.net{dl_href}" if dl_href.startswith("/") else dl_href
 
+                      # Download game
                       if download_url:
-                          with session.get(download_url, stream=True, timeout=60) as resp:
+                          with session.get(download_url, stream=True, timeout=60, verify=False) as resp:
                               if resp.status_code == 200:
                                   cd = resp.headers.get("Content-Disposition", "")
                                   ext = ".bin"
@@ -144,6 +170,7 @@ jobs:
                   downloaded_ids.add(game_id)
                   time.sleep(2)
 
+          # Save metadata
           os.makedirs("vimm", exist_ok=True)
           with open(index_path, "w", encoding="utf-8") as f:
               json.dump(all_games, f, indent=2, ensure_ascii=False)
@@ -151,8 +178,6 @@ jobs:
 
           # Git commit & push new files
           try:
-              subprocess.run(["git", "config", "--global", "user.name", "github-actions"], check=True)
-              subprocess.run(["git", "config", "--global", "user.email", "github-actions@users.noreply.github.com"], check=True)
               subprocess.run(["git", "add", "vimm/"], check=True)
               subprocess.run(["git", "commit", "-m", f"Add/update {SYSTEM} games"], check=False)
               subprocess.run(["git", "push", "origin", "HEAD"], check=True)
