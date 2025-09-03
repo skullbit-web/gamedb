@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       system:
-        description: "Vault system (e.g., N64, NES, SNES)"
+        description: "Vault system (e.g., N64, NES, SNES, PS2, GBA)"
         required: true
         default: "N64"
       max_pages:
@@ -29,16 +29,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install selenium==4.9.0 webdriver-manager requests beautifulsoup4
+          pip install selenium==4.9.0 webdriver-manager requests beautifulsoup4 pandas httplib2 argh
 
-      - name: Run scraper
+      - name: Run scraper inline
         env:
           SYSTEM: ${{ github.event.inputs.system }}
           MAX_PAGES: ${{ github.event.inputs.max_pages }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          cat > scrape_and_build.py << 'PY'
+          cat > run_scraper.py << 'PY'
           import os, json, re, time, requests, subprocess
           from selenium import webdriver
           from selenium.webdriver.chrome.service import Service
@@ -56,7 +56,7 @@ jobs:
               "Accept-Language": "en-US,en;q=0.9",
           })
 
-          # Stable Chrome setup for GitHub Actions
+          # Chrome options for headless GitHub Actions run
           chrome_options = Options()
           chrome_options.add_argument("--headless=new")
           chrome_options.add_argument("--no-sandbox")
@@ -67,7 +67,6 @@ jobs:
           service = Service(ChromeDriverManager().install())
           driver = webdriver.Chrome(service=service, options=chrome_options)
 
-          # Load existing index if available
           index_path = os.path.join("vimm", "index.json")
           if os.path.exists(index_path):
               with open(index_path, "r", encoding="utf-8") as f:
@@ -76,6 +75,8 @@ jobs:
           else:
               all_games = []
               downloaded_ids = set()
+
+          os.makedirs(os.path.join("vimm", "games", SYSTEM), exist_ok=True)
 
           for page in range(1, MAX_PAGES + 1):
               try:
@@ -150,25 +151,18 @@ jobs:
 
           driver.quit()
 
-          # Save metadata
           os.makedirs("vimm", exist_ok=True)
           with open(index_path, "w", encoding="utf-8") as f:
               json.dump(all_games, f, indent=2, ensure_ascii=False)
           print(f"Updated metadata + files for {len(all_games)} games to {index_path}")
-
-          # Git commit & push
-          try:
-              subprocess.run(["git", "config", "user.name", "github-actions"], check=True)
-              subprocess.run(["git", "config", "user.email", "github-actions@users.noreply.github.com"], check=True)
-              subprocess.run(["git", "add", "vimm/"], check=True)
-              subprocess.run(["git", "commit", "-m", f"Add/update {SYSTEM} games"], check=False)
-              token = os.environ.get("GITHUB_TOKEN")
-              repo = os.environ.get("GITHUB_REPOSITORY")
-              remote_url = f"https://x-access-token:{token}@github.com/{repo}.git"
-              subprocess.run(["git", "push", remote_url, "HEAD"], check=True)
-              print("Pushed new games to repo")
-          except Exception as e:
-              print(f"Git push failed: {e}")
           PY
 
-          python scrape_and_build.py
+          python3 run_scraper.py
+
+      - name: Commit & Push changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add vimm/
+          git commit -m "Update ${{ github.event.inputs.system }} games" || echo "No changes"
+          git push
