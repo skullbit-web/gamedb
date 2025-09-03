@@ -1,0 +1,116 @@
+import os, json, re, time, requests, subprocess
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+
+SYSTEM = os.environ.get("SYSTEM", "N64")
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "50"))
+
+base_url = "https://vimm.net/vault/"
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Metadata-Indexer (GitHub Actions)",
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+# Chrome options for headless GitHub Actions run
+chrome_options = Options()
+chrome_options.add_argument("--headless=new")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--remote-debugging-port=9222")
+
+service = Service(ChromeDriverManager().install())
+driver = webdriver.Chrome(service=service, options=chrome_options)
+
+index_path = os.path.join("vimm", "index.json")
+if os.path.exists(index_path):
+    with open(index_path, "r", encoding="utf-8") as f:
+        all_games = json.load(f)
+    downloaded_ids = {g["id"] for g in all_games if g.get("file")}
+else:
+    all_games = []
+    downloaded_ids = set()
+
+os.makedirs(os.path.join("vimm", "games", SYSTEM), exist_ok=True)
+
+for page in range(1, MAX_PAGES + 1):
+    try:
+        driver.get(f"{base_url}?mode=adv&p=list&system={SYSTEM}&sort=Title&sortOrder=ASC&page={page}")
+        html = driver.page_source
+    except Exception as e:
+        print(f"Failed to fetch page {page}: {e}")
+        break
+
+    soup = BeautifulSoup(html, "html.parser")
+    links = soup.select('a[href*="/vault/?id="]')
+    if not links:
+        break
+
+    for a in links:
+        title = a.get_text(strip=True)
+        href = a.get("href", "")
+        url = f"https://vimm.net{href}" if href.startswith("/") else f"https://vimm.net/vault/{href}"
+        m = re.search(r"[?&]id=(\d+)", url)
+        game_id = m.group(1) if m else ""
+        if not title or game_id in downloaded_ids:
+            continue
+
+        safe_name = re.sub(r'[^A-Za-z0-9_. -]', '_', title)[:100]
+        path = os.path.join("vimm", "games", SYSTEM, safe_name)
+        os.makedirs(path, exist_ok=True)
+
+        download_url = None
+        game_file = None
+        try:
+            driver.get(url)
+            detail_html = driver.page_source
+            detail_soup = BeautifulSoup(detail_html, "html.parser")
+            dl = detail_soup.select_one('a[href*="/download.php"]')
+            if dl and dl.get("href"):
+                dl_href = dl.get("href")
+                download_url = f"https://vimm.net{dl_href}" if dl_href.startswith("/") else dl_href
+
+            if download_url:
+                with session.get(download_url, stream=True, timeout=60) as resp:
+                    if resp.status_code == 200:
+                        cd = resp.headers.get("Content-Disposition", "")
+                        ext = ".bin"
+                        m = re.search(r'filename="?([^";]+)"?', cd)
+                        if m:
+                            filename = m.group(1)
+                            _, ext = os.path.splitext(filename)
+                        else:
+                            _, ext = os.path.splitext(download_url)
+
+                        game_file = os.path.join(path, f"{safe_name}{ext}")
+                        with open(game_file, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        print(f"Downloaded: {game_file}")
+        except Exception as e:
+            print(f"Failed to download {title}: {e}")
+
+        game_info = {
+            "system": SYSTEM,
+            "title": title,
+            "id": game_id,
+            "url": url,
+            "folder": path,
+            "download_url": download_url,
+            "file": game_file,
+        }
+        all_games.append(game_info)
+        downloaded_ids.add(game_id)
+        time.sleep(2)
+
+driver.quit()
+
+os.makedirs("vimm", exist_ok=True)
+with open(index_path, "w", encoding="utf-8") as f:
+    json.dump(all_games, f, indent=2, ensure_ascii=False)
+print(f"Updated metadata + files for {len(all_games)} games to {index_path}")
