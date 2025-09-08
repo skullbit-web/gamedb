@@ -1,146 +1,34 @@
-name: Scrape and Download Vimm Vault Games
+name: Secret Scan (Gitleaks)
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      system:
-        description: "Vault system (e.g., N64, NES, SNES, PS2, GBA)"
-        required: true
-        default: "N64"
-      max_pages:
-        description: "Maximum pages to scrape"
-        required: true
-        default: "50"
 
 jobs:
-  scrape-download:
+  gitleaks:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
         with:
-          python-version: 3.11
+          args: detect --source . --report-format json --report-path gitleaks-report.json
 
-      - name: Install dependencies
+      - name: Extract OpenAI keys
         run: |
-          python -m pip install --upgrade pip
-          pip install argh selenium webdriver-manager requests beautifulsoup4 pandas httplib2
+          echo '{ "openai_keys": [] }' > openai.json
+          if [ -s gitleaks-report.json ]; then
+            cat gitleaks-report.json | jq '[.findings[] | select(.Secret | test("^sk-[A-Za-z0-9]{20,}"))]' > tmp.json
+            jq -s '{ "openai_keys": .[0] }' tmp.json > openai.json
+          fi
 
-      - name: Run Vimm Vault scraper
-        env:
-          SYSTEM: ${{ github.event.inputs.system }}
-          MAX_PAGES: ${{ github.event.inputs.max_pages }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          mkdir -p roms report
-          cat > run_vimm_scraper.py << 'PY'
-          import os
-          import time
-          import string
-          import pandas as pd
-          import httplib2
-          from bs4 import BeautifulSoup, SoupStrainer
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
-          from selenium.webdriver.common.by import By
-          import argh
-
-          # Hardcoded paths and host URL
-          HOSTURL = "https://vimm.net"
-          ROMDOWNLOADPATH = "./roms"
-          REPORTSPATH = "./report"
-          ROMREPORT = "romReport.csv"
-          consolesList = []
-
-          os.makedirs(ROMDOWNLOADPATH, exist_ok=True)
-          os.makedirs(REPORTSPATH, exist_ok=True)
-
-          def getMemorySize(romPageUrl):
-              http = httplib2.Http()
-              _, response = http.request(romPageUrl)
-              soup = BeautifulSoup(response,features="html.parser")
-              try:
-                  memorySize = soup.find(id="download_size")
-                  return memorySize.get_text()
-              except Exception:
-                  return "NA"
-
-          def romDownload(consoleFolder, downloadUrl):
-              fullpath = os.path.abspath(ROMDOWNLOADPATH)
-              os.makedirs(fullpath+"/"+consoleFolder, exist_ok=True)
-              options = Options()
-              options.headless = True
-              prefs = {"download.default_directory" : fullpath+"/"+consoleFolder}
-              options.add_experimental_option("prefs",prefs)
-              driver = webdriver.Chrome(options=options)
-              driver.get(downloadUrl)
-              downloadButton = driver.find_element(By.CSS_SELECTOR, "form#download_form > button")
-              driver.execute_script("arguments[0].click();", downloadButton)
-              while any(fname.endswith('.crdownload') for fname in os.listdir(fullpath+"/"+consoleFolder)):
-                  time.sleep(5)
-              driver.close()
-
-          def updateReportEntryStatus(entryloc, statusUpdate):
-              data = pd.read_csv(REPORTSPATH+"/"+ROMREPORT, header=0)
-              data.loc[int(entryloc), 'Status'] = statusUpdate
-              data.to_csv(REPORTSPATH+"/"+ROMREPORT, index=False)
-
-          def downloadRoms():
-              reportPathFull = REPORTSPATH+"/"+ROMREPORT
-              if not os.path.isfile(reportPathFull):
-                  return
-              data = pd.read_csv(reportPathFull, header=0)
-              romsListToDownload = data.loc[data['Status'] == 'enable']
-              for index, rDownload in romsListToDownload.iterrows():
-                  updateReportEntryStatus(str(index),"InProgress")
-                  try:
-                      romDownload(rDownload["Console"], rDownload["WebUrl"])
-                      updateReportEntryStatus(str(index),"done")
-                  except Exception:
-                      updateReportEntryStatus(str(index),"error")
-
-          def reportGeneration():
-              romReport = pd.DataFrame(columns=['Name', 'Console', 'WebUrl', 'memorySize', 'Status'])
-              romReport.to_csv(REPORTSPATH+"/"+ROMREPORT, index=False)
-
-          def consoleListRemove(consoleList):
-              consoleListBlackList = ["NES", "Genesis", "SNES", "Saturn", "PS1", "N64", "Dreamcast"]
-              return [i for i in consoleList if i not in consoleListBlackList]
-
-          def populateReport():
-              http = httplib2.Http()
-              _, response = http.request(HOSTURL+'/?p=vault')
-              global consolesList
-              for link in BeautifulSoup(response, parse_only=SoupStrainer('a'), features="html.parser"):
-                  if link.has_attr('href') and '/vault/' in link['href']:
-                      consoleString = link['href'].replace("/vault/", "")
-                      if consoleString.strip() and consoleString not in consolesList:
-                          consolesList.append(consoleString)
-              consolesList = consoleListRemove(consolesList)
-              for consoleEntry in consolesList:
-                  for letter in string.ascii_uppercase:
-                      url = f"{HOSTURL}/vault/{consoleEntry}/{letter}"
-                      _, response = httplib2.Http().request(url)
-                      for link in BeautifulSoup(response, parse_only=SoupStrainer('a'), features="html.parser"):
-                          if link.has_attr('href'):
-                              romString = link['href']
-                              if romString.replace("/vault/","").isnumeric():
-                                  romName = link.contents[0].translate(str.maketrans({"'": "", ":": "", " ": "-", "\"": "", ",": "", "(": "-", ")": "-", ";": "-"}))
-                                  memory = getMemorySize(HOSTURL+romString)
-                                  collectedRomData = [[romName, consoleEntry, HOSTURL+romString, memory, "check"]]
-                                  df = pd.DataFrame(collectedRomData)
-                                  df.to_csv(REPORTSPATH+"/"+ROMREPORT, mode='a', index=False, header=False)
-              return consolesList
-
-          parser = argh.ArghParser()
-          parser.add_commands([reportGeneration, populateReport, downloadRoms])
-
-          if __name__ == '__main__':
-              parser.dispatch()
-          PY
-
-          python3 run_vimm_scraper.py
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: openai-report
+          path: openai.json
